@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m alembic:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python:*)",
+      "Bash(tree:*)",
+      "Bash(timeout 5 python:*)",
+      "Bash(timeout:*)",
+      "SlashCommand(/diagnose)",
+      "Bash(pip install:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
