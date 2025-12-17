@@ -6,9 +6,11 @@ Entry point for the OpenAI-compatible REST API that Aurora TA will consume.
 
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Dict, Any
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +21,7 @@ from fastapi.responses import JSONResponse
 load_dotenv()
 
 from api.routes import assistants, threads, runs
+from database import StateManager
 
 # Configure logging
 logging.basicConfig(
@@ -79,18 +82,135 @@ async def shutdown_event():
 # HEALTH CHECK ENDPOINT
 # ============================================================================
 
-@app.get("/health", summary="Health Check", description="System health status")
-async def health_check() -> Dict[str, Any]:
+# Health check timeout (seconds)
+HEALTH_CHECK_TIMEOUT = 3.0
+
+# Sovereign Playground URL for health checks
+SOVEREIGN_PLAYGROUND_URL = os.getenv("SOVEREIGN_PLAYGROUND_URL", "http://localhost:8080")
+
+
+async def check_database() -> Dict[str, Any]:
     """
-    Health check endpoint.
+    Check database connectivity by running a simple query.
 
     Returns:
-        Dictionary with status, version, and timestamp
+        Dict with status and latency
     """
+    start = time.time()
+    try:
+        # Create a temporary StateManager to test connection
+        state_manager = StateManager()
+        # Run a simple query - list assistants with limit 1
+        state_manager.list_assistants(limit=1)
+        latency_ms = round((time.time() - start) * 1000, 2)
+        return {
+            "status": "healthy",
+            "latency_ms": latency_ms,
+        }
+    except Exception as e:
+        latency_ms = round((time.time() - start) * 1000, 2)
+        logger.error(f"Database health check failed: {e}")
+        return {
+            "status": "unhealthy",
+            "latency_ms": latency_ms,
+            "error": str(e),
+        }
+
+
+async def check_sovereign_playground() -> Dict[str, Any]:
+    """
+    Check Sovereign Playground connectivity.
+
+    Returns:
+        Dict with status and latency
+    """
+    start = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT) as client:
+            # Try health endpoint first, fall back to models endpoint
+            response = await client.get(f"{SOVEREIGN_PLAYGROUND_URL}/health")
+            latency_ms = round((time.time() - start) * 1000, 2)
+
+            if response.status_code == 200:
+                return {
+                    "status": "healthy",
+                    "latency_ms": latency_ms,
+                    "url": SOVEREIGN_PLAYGROUND_URL,
+                }
+            else:
+                return {
+                    "status": "unhealthy",
+                    "latency_ms": latency_ms,
+                    "url": SOVEREIGN_PLAYGROUND_URL,
+                    "error": f"HTTP {response.status_code}",
+                }
+    except httpx.ConnectError:
+        latency_ms = round((time.time() - start) * 1000, 2)
+        return {
+            "status": "unhealthy",
+            "latency_ms": latency_ms,
+            "url": SOVEREIGN_PLAYGROUND_URL,
+            "error": "Connection refused - service may be down",
+        }
+    except httpx.TimeoutException:
+        latency_ms = round((time.time() - start) * 1000, 2)
+        return {
+            "status": "unhealthy",
+            "latency_ms": latency_ms,
+            "url": SOVEREIGN_PLAYGROUND_URL,
+            "error": f"Timeout after {HEALTH_CHECK_TIMEOUT}s",
+        }
+    except Exception as e:
+        latency_ms = round((time.time() - start) * 1000, 2)
+        logger.error(f"Sovereign Playground health check failed: {e}")
+        return {
+            "status": "unhealthy",
+            "latency_ms": latency_ms,
+            "url": SOVEREIGN_PLAYGROUND_URL,
+            "error": str(e),
+        }
+
+
+@app.get("/health", summary="Health Check", description="System health status with dependency checks")
+async def health_check() -> Dict[str, Any]:
+    """
+    Health check endpoint with real dependency verification.
+
+    Checks:
+        - Database connectivity (SQLite)
+        - Sovereign Playground connectivity (inference layer)
+
+    Status logic:
+        - All checks pass → "healthy"
+        - Sovereign down but database works → "degraded"
+        - Database down → "unhealthy"
+
+    Returns:
+        Dictionary with status, version, timestamp, and detailed checks
+    """
+    # Run health checks
+    db_check = await check_database()
+    sovereign_check = await check_sovereign_playground()
+
+    # Determine overall status
+    db_healthy = db_check["status"] == "healthy"
+    sovereign_healthy = sovereign_check["status"] == "healthy"
+
+    if db_healthy and sovereign_healthy:
+        overall_status = "healthy"
+    elif db_healthy and not sovereign_healthy:
+        overall_status = "degraded"  # Can store, can't generate
+    else:
+        overall_status = "unhealthy"  # Can't function at all
+
     return {
-        "status": "healthy",
+        "status": overall_status,
         "version": "1.0.0",
         "timestamp": datetime.utcnow().isoformat(),
+        "checks": {
+            "database": db_check,
+            "sovereign_playground": sovereign_check,
+        },
     }
 
 
